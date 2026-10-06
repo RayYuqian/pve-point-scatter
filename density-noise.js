@@ -350,12 +350,15 @@
     return contrast(value, settings.amplitude);
   }
 
+  // PVE's execution source bounds are [-1, 1] cm, so the edge box is 2 cm at the origin, not the planting area.
+  var edgeBoxHalf = 1;
+
   function edgeMask(worldX, worldY, noiseX, noiseY, iterations, settings) {
     var scale = 0.01 * settings.frequency;
-    var left = (worldX + settings.halfX) * scale;
-    var right = (worldX - settings.halfX) * scale;
-    var top = (worldY + settings.halfY) * scale;
-    var bottom = (worldY - settings.halfY) * scale;
+    var left = (worldX + edgeBoxHalf) * scale;
+    var right = (worldX - edgeBoxHalf) * scale;
+    var top = (worldY + edgeBoxHalf) * scale;
+    var bottom = (worldY - edgeBoxHalf) * scale;
     var useX = Math.abs(left) < Math.abs(right) ? left : right;
     var useY = Math.abs(top) < Math.abs(bottom) ? top : bottom;
     var current = Math.min(Math.abs(useX), Math.abs(useY));
@@ -363,31 +366,44 @@
     if (blend <= 0.0001) return 1;
     var noiseValue = contrast(perlin(noiseX, noiseY, iterations), 1);
     var offsetAmount = blend;
-    var noised = noiseValue * offsetAmount + (1 - offsetAmount) * (1 - (1 - noiseValue) * (1 - offsetAmount));
+    var low = Math.min(offsetAmount, noiseValue * offsetAmount);
+    var high = 1 - Math.min(1 - offsetAmount, (1 - noiseValue) * (1 - offsetAmount));
+    var noised = low + (high - low) * offsetAmount;
     return 1 - Math.min(1, Math.max(0, contrast(noised, settings.amplitude)));
   }
 
+  // Keep Create Points Grid's exact arithmetic and X-first order: tie-breaking and pruning depend on both.
+  function gridAxis(size, resolution) {
+    var cell = size / resolution;
+    var extent = size / 2;
+    var count = Math.trunc((2 * extent) / cell);
+    if (extent < cell / 2) count++;
+    return { cell: cell, count: count, extent: extent, start: extent - extent % (cell / 2) };
+  }
+
   function candidates(settings) {
-    var width = settings.gx * settings.scatter;
-    var depth = settings.gy * settings.scatter;
     var resolution = Math.max(1, Math.round(settings.resolution));
-    var cellX = width / resolution;
-    var cellY = depth / resolution;
-    var halfX = width / 2;
-    var halfY = depth / 2;
-    var radius = Math.min(halfX, halfY);
+    var axisX = gridAxis(settings.gx * settings.scatter, resolution);
+    var axisY = gridAxis(settings.gy * settings.scatter, resolution);
+    var radius = Math.min(axisX.extent, axisY.extent);
     var points = [];
     var iy;
     var ix;
-    for (iy = 0; iy < resolution; iy++) {
-      for (ix = 0; ix < resolution; ix++) {
-        var x = -halfX + cellX * (ix + 0.5);
-        var y = -halfY + cellY * (iy + 0.5);
-        if (settings.shape === 1 && Math.hypot(x, y) > radius) continue;
+    for (iy = 0; iy < axisY.count; iy++) {
+      for (ix = 0; ix < axisX.count; ix++) {
+        var x = axisX.cell * (ix + 0.5) - axisX.start;
+        var y = axisY.cell * (iy + 0.5) - axisY.start;
+        if (settings.shape === 1 && !(x * x + y * y <= radius * radius)) continue;
         points.push({ x: x, y: y });
       }
     }
-    return { points: points, halfX: halfX, halfY: halfY };
+    return {
+      points: points,
+      halfX: axisX.extent,
+      halfY: axisY.extent,
+      boundsX: axisX.cell * 0.5,
+      boundsY: axisY.cell * 0.5
+    };
   }
 
   function readSettings() {
@@ -422,9 +438,7 @@
       frequency: settings.scaleFrequency,
       offset: settings.scaleOffset,
       amplitude: settings.scaleAmplitude,
-      turbulance: settings.scaleTurbulance,
-      halfX: settings.halfX,
-      halfY: settings.halfY
+      turbulance: settings.scaleTurbulance
     };
   }
 
@@ -434,9 +448,7 @@
       frequency: settings.frequency,
       offset: settings.offset,
       amplitude: settings.amplitude,
-      turbulance: iterations,
-      halfX: settings.halfX,
-      halfY: settings.halfY
+      turbulance: iterations
     };
   }
 
@@ -445,32 +457,163 @@
     return sample(worldX, worldY, settings) - sample(worldX, worldY, withTurbulance(settings, 1));
   }
 
-  function pointSize(point, settings) {
+  var f32 = Math.fround;
+
+  function lerp(a, b, t) {
+    return a + t * (b - a);
+  }
+
+  function pointSize(point, edge, settings) {
     var noise = sample(point.x, point.y, scaleSettings(settings));
-    var edge = 1 - Math.min(1, Math.max(0, Math.hypot(point.x, point.y) / 100));
-    var mix = (1 - settings.nose) + settings.nose * noise;
-    var edgeMix = (1 - settings.scaleBorder) + settings.scaleBorder * edge;
-    return settings.pointScale * mix * edgeMix;
+    var size = lerp(1, noise, settings.nose) * settings.pointScale;
+    return lerp(size, size * edge, settings.scaleBorder);
+  }
+
+  function swapAt(items, a, b) {
+    var held = items[a];
+    items[a] = items[b];
+    items[b] = held;
+  }
+
+  function heapSiftDown(items, first, index, count, before) {
+    while (index * 2 + 1 < count) {
+      var child = index * 2 + 1;
+      if (child + 1 < count && !before(items[first + child], items[first + child + 1])) child++;
+      if (!before(items[first + child], items[first + index])) break;
+      swapAt(items, first + index, first + child);
+      index = child;
+    }
+  }
+
+  function heapSort(items, first, count, before) {
+    if (count < 2) return;
+    var after = function (a, b) { return before(b, a); };
+    var index;
+    for (index = Math.floor((count - 2) / 2); ; index--) {
+      heapSiftDown(items, first, index, count, after);
+      if (index === 0) break;
+    }
+    for (index = count - 1; index > 0; index--) {
+      swapAt(items, first, first + index);
+      heapSiftDown(items, first, 0, index, after);
+    }
+  }
+
+  // Port of Algo::IntroSort (what TArray::Sort uses). Unstable; tied scores land where its pivot swaps put them.
+  function introSort(items, before) {
+    var count = items.length;
+    if (count < 2) return;
+    var stack = [[0, count - 1, Math.trunc(f32(f32(Math.log(count)) * 2))]];
+    while (stack.length) {
+      var range = stack.pop();
+      var min = range[0];
+      var max = range[1];
+      var depth = range[2];
+      for (;;) {
+        count = max - min + 1;
+        if (depth === 0) {
+          heapSort(items, min, count, before);
+          break;
+        }
+        if (count <= 8) {
+          while (max > min) {
+            var largest = min;
+            var item;
+            for (item = min + 1; item <= max; item++) {
+              if (before(items[largest], items[item])) largest = item;
+            }
+            swapAt(items, largest, max--);
+          }
+          break;
+        }
+        swapAt(items, min + Math.floor(count / 2), min);
+        var low = min;
+        var high = max + 1;
+        for (;;) {
+          while (++low <= max && !before(items[min], items[low]));
+          while (--high > min && !before(items[high], items[min]));
+          if (low > high) break;
+          swapAt(items, low, high);
+        }
+        swapAt(items, min, high);
+        depth--;
+        if (high - 1 - min >= max - low) {
+          if (min + 1 < high) stack.push([min, high - 1, depth]);
+          if (max > low) {
+            min = low;
+            continue;
+          }
+        } else {
+          if (max > low) stack.push([low, max, depth]);
+          if (min + 1 < high) {
+            max = high - 1;
+            continue;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  function pruneBox(center, half, scale) {
+    var extent = Math.abs(half * scale);
+    var min = center - extent;
+    var size = 0.5 * (center + extent - min);
+    return [min + size, size];
+  }
+
+  function overlaps(a, b) {
+    return !(Math.abs(a.box[0][0] - b.box[0][0]) > a.box[0][1] + b.box[0][1] ||
+      Math.abs(a.box[1][0] - b.box[1][0]) > a.box[1][1] + b.box[1][1]);
+  }
+
+  // Self Pruning, LargeToSmall on $Density with Radius Similarity Factor 0.1 (a float in the editor).
+  var pruneEquality = f32(1 + f32(0.1)) * f32(1 + f32(0.1));
+
+  function selfPrune(sorted) {
+    var order = sorted.map(function (point, index) { return index; });
+    introSort(order, function (a, b) {
+      return !(f32(sorted[a].score * pruneEquality) < sorted[b].score);
+    });
+    var kept = new Uint8Array(sorted.length);
+    var excluded = new Uint8Array(sorted.length);
+    order.forEach(function (index) {
+      if (excluded[index]) return;
+      kept[index] = 1;
+      var other;
+      for (other = 0; other < sorted.length; other++) {
+        if (!kept[other] && overlaps(sorted[index], sorted[other])) excluded[other] = 1;
+      }
+    });
+    return sorted.filter(function (point, index) { return kept[index]; });
   }
 
   function scored(settings) {
     var grid = candidates(settings);
-    settings.halfX = grid.halfX;
-    settings.halfY = grid.halfY;
-    var effect = settings.effect;
-    var border = settings.border;
     var points = grid.points.map(function (point, index) {
-      var noise = sample(point.x, point.y, settings);
-      var edge = 1 - Math.min(1, Math.max(0, Math.hypot(point.x, point.y) / 100));
-      var noiseMix = (1 - effect) + effect * noise;
-      var score = noiseMix * ((1 - border) + border * edge);
-      var sizeValue = pointSize(point, settings);
-      return { x: point.x, y: point.y, noise: noise, score: score, sizeValue: sizeValue, index: index };
+      var noise = f32(sample(point.x, point.y, settings));
+      var edge = f32(1 - f32(Math.min(1, Math.max(0, Math.hypot(point.x, point.y) / 100))));
+      var noiseMix = f32(lerp(1, noise, settings.effect));
+      var score = f32(lerp(noiseMix, f32(noiseMix * edge), settings.border));
+      var sizeValue = pointSize(point, edge, settings);
+      return {
+        x: point.x,
+        y: point.y,
+        noise: noise,
+        score: score,
+        sizeValue: sizeValue,
+        index: index,
+        box: [pruneBox(point.x, grid.boundsX, sizeValue), pruneBox(point.y, grid.boundsY, sizeValue)]
+      };
     });
-    var ordered = points.slice().sort(function (a, b) {
-      return b.score - a.score || a.index - b.index;
+    var order = points.map(function (point, index) { return index; });
+    introSort(order, function (a, b) {
+      var scoreA = points[a].score;
+      var scoreB = points[b].score;
+      return Math.abs(scoreA - scoreB) > 1e-8 && scoreA > scoreB;
     });
-    var kept = effect > 0 ? ordered.slice(0, settings.num) : randomChoice(ordered, settings.num);
+    var survivors = selfPrune(order.map(function (index) { return points[index]; }));
+    var kept = settings.effect > 0 ? survivors.slice(0, settings.num) : randomChoice(survivors, settings.num);
     return { settings: settings, points: points, kept: kept, halfX: grid.halfX, halfY: grid.halfY };
   }
 
