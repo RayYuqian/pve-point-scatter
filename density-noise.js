@@ -16,7 +16,7 @@
         { id: "scatter", label: "Scatter Grid Size", min: 0.1, max: 4, step: 0.1, value: 2, tip: "Multiplies both side lengths. 1 leaves Grid Size as it is. 2 doubles the sides and the gap between candidate spots." },
         { id: "resolution", label: "Resolution", min: 2, max: 48, step: 1, value: 32, tip: "How many candidate spots fit along each side. The gap is (Grid Size × Scatter Grid Size) ÷ Resolution. Num Points still decides how many of those spots are kept." },
         { id: "shape", label: "Shape Type", select: [["0", "0 rectangle"], ["1", "1 circle"]], value: "1", tip: "0 keeps the rectangle. 1 drops the corners and keeps a circle. The radius is half of the shorter side." },
-        { id: "num", label: "Num Points", min: 1, max: 80, step: 1, value: 20, tip: "How many starting points to keep. With Density Noise Effect above 0, the highest scores stay. At 0 the editor draws a random set instead, so the markers on this page stay off." }
+        { id: "num", label: "Num Points", min: 1, max: 80, step: 1, value: 20, tip: "How many starting points to keep. With Density Noise Effect above 0, the highest scores stay. At 0 the editor draws a random set of this many instead." }
       ]
     },
     {
@@ -467,13 +467,25 @@
       var sizeValue = pointSize(point, settings);
       return { x: point.x, y: point.y, noise: noise, score: score, sizeValue: sizeValue, index: index };
     });
-    var kept = [];
-    if (effect > 0) {
-      kept = points.slice().sort(function (a, b) {
-        return b.score - a.score || a.index - b.index;
-      }).slice(0, settings.num);
-    }
+    var ordered = points.slice().sort(function (a, b) {
+      return b.score - a.score || a.index - b.index;
+    });
+    var kept = effect > 0 ? ordered.slice(0, settings.num) : randomChoice(ordered, settings.num);
     return { settings: settings, points: points, kept: kept, halfX: grid.halfX, halfY: grid.halfY };
+  }
+
+  function randomChoice(points, count) {
+    var order = points.slice();
+    var seed = 0x5eed;
+    var i;
+    for (i = order.length - 1; i > 0; i--) {
+      seed = Math.imul(seed ^ (seed >>> 15), 0x6d2b79f5);
+      var j = (seed >>> 0) % (i + 1);
+      var swap = order[i];
+      order[i] = order[j];
+      order[j] = swap;
+    }
+    return order.slice(0, Math.min(count, order.length));
   }
 
   function worldToCanvas(x, y, halfX, halfY, size, pad) {
@@ -605,7 +617,7 @@
     if (status) {
       status.textContent = model.settings.effect > 0
         ? "Markers are the highest scores, up to Num Points. Their size is the scale value."
-        : "Density Noise Effect is 0, so the editor picks at random. Markers stay off here.";
+        : "Density Noise Effect is 0, so these markers are one random draw of Num Points. The editor uses its own seed, so its draw can land somewhere else.";
     }
     saveStored();
   }
